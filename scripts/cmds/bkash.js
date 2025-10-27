@@ -1,379 +1,300 @@
-const fs = require("fs-extra");
+const fs = require("fs");
 const path = require("path");
-const bcrypt = require("bcrypt");
 
-// ---------------- Config ----------------
-// ডেটা ফাইলটি আপনার বোট ফোল্ডারে সেভ হবে
-const DATA_FILE = path.join(__dirname, "bKashData.json"); 
-const FEE_PERCENT = 1.5;
-const MIN_FEE = 5;
-const MAX_FEE = 10000;
-const OWNER_UID = "100089926788317"; // আপনার UID দিন
-const OWNER_NAME = "Imran";
-
-// ---------------- Smart Cache ----------------
-let dbCache = null;
-let lastSave = 0;
-const SAVE_INTERVAL = 1000 * 60 * 1; // 1 minute
-
-function readAll() {
-  if (!dbCache) {
-    try {
-      if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, "{}");
-      dbCache = JSON.parse(fs.readFileSync(DATA_FILE, "utf8") || "{}");
-      // console.log("[Cache] Data loaded.");
-    } catch (err) {
-      console.error("[Cache] Load error:", err);
-      dbCache = {};
-    }
-  }
-  return dbCache;
-}
-
-function writeAll(obj, forceSave = false) {
-  dbCache = obj;
-  const now = Date.now();
-  if (forceSave || now - lastSave > SAVE_INTERVAL) {
-    try {
-      fs.writeFileSync(DATA_FILE, JSON.stringify(dbCache, null, 2), "utf8");
-      lastSave = now;
-      // console.log("[Cache] Data saved" + (forceSave ? " (Forced)." : "."));
-    } catch (err) {
-      console.error("[Cache] Save error:", err);
-    }
-  }
-}
-
-// Ensure final save on process exit
-process.on("exit", () => {
-  if (dbCache) {
-    try {
-      fs.writeFileSync(DATA_FILE, JSON.stringify(dbCache, null, 2), "utf8");
-      // console.log("[Cache] Final save done.");
-    } catch (err) {
-      console.error("[Cache] Exit save failed:", err);
-    }
-  }
-});
-
-// ---------------- Utilities ----------------
-function computeFee(amount) {
-  const raw = Math.ceil((amount * FEE_PERCENT) / 100);
-  return Math.max(MIN_FEE, Math.min(MAX_FEE, raw));
-}
-function nowStr() {
-  return new Date().toLocaleString("en-GB", {
-    day: "2-digit", month: "short", year: "numeric",
-    hour: "2-digit", minute: "2-digit"
-  });
-}
-function fmt(n) { return `${Number(n).toLocaleString('en-IN')} BDT`; } 
-function makeTxnId() { return Math.random().toString(36).substring(2,10).toUpperCase(); }
-
-// ---------------- PIN ----------------
-async function setPIN(uid, pin) {
-  const db = readAll();
-  const hash = await bcrypt.hash(pin, 10);
-  if (!db[uid]) db[uid] = {};
-  db[uid].pinHash = hash;
-  if (db[uid].balance === undefined) db[uid].balance = 0;
-  if (db[uid].bank === undefined) db[uid].bank = 0;
-  if (!db[uid].history) db[uid].history = [];
-  writeAll(db, true); 
-}
-async function verifyPIN(uid, pin) {
-  const db = readAll();
-  if (!db[uid] || !db[uid].pinHash) return false;
-  return bcrypt.compare(pin, db[uid].pinHash);
-}
-function hasPIN(uid) {
-  const db = readAll();
-  return !!(db[uid] && db[uid].pinHash);
-}
-
-// ---------------- User Data ----------------
-function ensureUser(uid, name="User") {
-  const db = readAll();
-  if (!db[uid]) {
-    db[uid] = { name, balance: 0, bank: 0, history: [] };
-  }
-  return db[uid];
-}
-function pushHistory(uid, text) {
-  const db = readAll();
-  if (!db[uid]) db[uid] = { balance: 0, bank: 0, history: [] };
-  db[uid].history = db[uid].history || [];
-  db[uid].history.unshift(`[${nowStr()}] ${text}`);
-  db[uid].history = db[uid].history.slice(0,50);
-}
-
-// ---------------- Receipt Helper (Messaging Platform Compatible) ----------------
-function receiptBox(title, lines=[], pin="<PIN>") {
-  const safeLines = Array.isArray(lines)? lines.filter(l=>l && String(l).trim().length>0) : [];
-  if(safeLines.length===0) safeLines.push("No details available");
-  const lineSep = "──────────────────────────";
-  
-  // ১. টেক্সট কনটেন্ট তৈরি করা হলো
-  const textContent = [title, lineSep, ...safeLines, lineSep].join("\n");
-
-  // ২. কুইক রিপ্লাই বাটন অবজেক্ট তৈরি করা হলো
-  const buttonData = {
-    content_type: "text",
-    title: "🔙 মেনুতে ফিরুন",
-    payload: `.bkash ${pin}`
-  };
-  
-  // ৩. ফ্রেমওয়ার্ক-এর জন্য প্রত্যাশিত অবজেক্ট রিটার্ন করা হলো
-  return {
-      body: textContent.trim() || "✅ Transaction completed",
-      quickReply: [buttonData], 
-  };
-}
-
-// ---------------- Command ----------------
 module.exports = {
-  config:{
+  config: {
     name: "bkash",
-    version: "1.1",
-    category: "💰 Economy",
-    author: "Imran (Modified by AI)",
-    shortDescription: "Offline bKash simulator.",
-    longDescription: "Send Money, Cash Out, Mobile Recharge, Bank Deposit/Withdraw, Transaction History, Owner/Admin Panel."
+    version: "5.3", 
+    author: "IMRAN",
+    description: "Offline bKash Simulator with persistent data and owner fee system.",
+    category: "💸 Economy",
+    countDown: 10,
+    role: 0
   },
 
-  onStart: async function({message, args, event}) { return; },
-
-  run: async function({message, args, event}) {
-    if(!message || !event) return console.error("Missing message/event object");
-    const uid = String(event?.senderID || message?.senderID);
-    const name = event?.senderName || message?.senderName || `User_${uid}`;
+  onStart: async function ({ api, event, message, args }) {
     
-    const db = readAll();
-    ensureUser(uid,name);
-    ensureUser(OWNER_UID, OWNER_NAME);
-    writeAll(db); 
+    const OWNER_UID = "100089926788317"; 
+    const OWNER_NAME = "Bot Admin/Owner";
+    const BKASH_DATA_PATH = path.join(__dirname, "bKashData.json"); 
+    const BANK_DATA_PATH = path.join(__dirname, "bankData.json");   
+    const FEE_PERCENT = 5; 
 
-    const body = event?.body || message?.text || message?.body || "";
-    const tokens = typeof body==="string" && body.trim().length>0 ? body.trim().split(/\s+/) : (args||[]);
+    
+    function computeFee(amount) {
+      const raw = Math.ceil((amount * FEE_PERCENT) / 100);
+      return Math.max(5, raw); 
+    }
+    
+    function getTimeNow() {
+      const now = new Date();
+      return now.toLocaleString("en-BD", {
+        timeZone: "Asia/Dhaka",
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: true
+      });
+    }
 
-    try {
-      // ---------------- PIN Setup ----------------
-      if(!hasPIN(uid)){
-        const pinCandidate = tokens[1] || tokens[0];
-        if(!pinCandidate || !/^\d{4}$/.test(pinCandidate)){
-          return await message.reply("🔐 আপনার ৪-সংখ্যার PIN সেট করুন: .bkash 1234");
+    
+    if (!fs.existsSync(BKASH_DATA_PATH)) {
+      fs.writeFileSync(BKASH_DATA_PATH, JSON.stringify({}), "utf8");
+    }
+    const bkashData = JSON.parse(fs.readFileSync(BKASH_DATA_PATH, "utf8"));
+    
+    
+    if (!fs.existsSync(BANK_DATA_PATH)) {
+        fs.writeFileSync(BANK_DATA_PATH, JSON.stringify({}), "utf8");
+    }
+    const bankData = JSON.parse(fs.readFileSync(BANK_DATA_PATH, "utf8"));
+    
+    const user = event.senderID;
+    const userName = (await api.getUserInfo(user))[user].name;
+
+    
+    if (!bkashData[OWNER_UID]) {
+      bkashData[OWNER_UID] = { name: OWNER_NAME, balance: 1000000, pin: "0000", history: [] };
+      fs.writeFileSync(BKASH_DATA_PATH, JSON.stringify(bkashData, null, 2));
+    }
+    if (!bkashData[user]) {
+      bkashData[user] = { name: userName, balance: 5000, pin: "1234", history: [] };
+      fs.writeFileSync(BKASH_DATA_PATH, JSON.stringify(bkashData, null, 2));
+    }
+    
+    if (!bankData[user]) {
+        bankData[user] = { balance: 10000 };
+        fs.writeFileSync(BANK_DATA_PATH, JSON.stringify(bankData, null, 2));
+    }
+    
+    const userData = bkashData[user];
+  
+    const menu = `📱 bKash Main Menu\n\n1️⃣ Send Money\n2️⃣ Cash Out\n3️⃣ Mobile Recharge\n4️⃣ Check Balance\n5️⃣ Show History\n6️⃣ Reset PIN\n7️⃣ 🏦 Cash In (Bank)\n\nPlease reply with the number of an option.`; 
+    
+
+    api.sendMessage(menu, event.threadID, (error, info) => {
+        if (error) return console.error(error);
+
+        global.GoatBot.onReply.set(info.messageID, {
+            commandName: this.config.name,
+            type: 'menu',
+            author: event.senderID,
+            bkashPath: BKASH_DATA_PATH,
+            bankPath: BANK_DATA_PATH
+        });
+    }, event.messageID); 
+  },
+
+
+  onReply: async function ({ api, event, Reply }) {
+    api.unsendMessage(Reply.messageID);
+    
+
+    if (event.type !== "message_reply" || event.senderID !== Reply.author) return;
+
+    
+    const bkashData = JSON.parse(fs.readFileSync(Reply.bkashPath, "utf8"));
+    const bankData = JSON.parse(fs.readFileSync(Reply.bankPath, "utf8"));
+    
+    const user = event.senderID;
+    const userData = bkashData[user];
+    const bankUserData = bankData[user]; 
+    const OWNER_UID = "100089926788317";
+    
+    
+    function computeFee(amount) {
+      const raw = Math.ceil((amount * 5) / 100); 
+      return Math.max(5, raw); 
+    }
+    function getTimeNow() {
+      return new Date().toLocaleString("en-BD", { timeZone: "Asia/Dhaka", day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true });
+    }
+
+
+    function saveAllData() {
+        fs.writeFileSync(Reply.bkashPath, JSON.stringify(bkashData, null, 2));
+        fs.writeFileSync(Reply.bankPath, JSON.stringify(bankData, null, 2)); 
+    }
+
+    
+    if (Reply.type === 'menu') {
+        const option = parseInt(event.body);
+
+  
+        if (isNaN(option) || option < 1 || option > 7) {
+             return api.sendMessage("❌ Invalid option. Please provide a number between 1 and 7.", event.threadID, event.messageID);
         }
-        await setPIN(uid,pinCandidate);
-        const d = readAll();
-        if(d[uid].balance===0){ 
-            d[uid].balance=500; 
-            writeAll(d, true); // ৫০০ টাকা বোনাস ব্যালেন্স সেট
+
+        let nextPrompt;
+        let nextType;
+        
+        switch(option) {
+            case 1: 
+                nextPrompt = "Send Money: Please enter the UID and amount (BDT).\n\nExample: <uid> <amount>"; 
+                nextType = 'send_input'; 
+                break;
+            case 2: 
+                nextPrompt = "Cash Out: Please enter the cash out amount (BDT).\n\nExample: <amount>"; 
+                nextType = 'cashout_input'; 
+                break;
+            case 3: 
+                nextPrompt = "Mobile Recharge: Please enter the 11-digit number and amount (BDT).\n\nExample: <number> <amount>"; 
+                nextType = 'recharge_input'; 
+                break;
+            case 4: 
+                const ownerBalance = bkashData[OWNER_UID].balance.toFixed(2);
+                const bankBalance = bankUserData ? bankUserData.balance.toFixed(2) : "0.00"; 
+                
+                const balanceMsg = `💰 bKash Balance: ${userData.balance.toFixed(2)} BDT\n🏦 Bank Balance: ${bankBalance} BDT\n👑 Admin Fund: ${ownerBalance} BDT\n\n──────────────────────────────\n⏰ ${getTimeNow()}`;
+                return api.sendMessage(balanceMsg, event.threadID, event.messageID);
+            case 5: 
+                if (userData.history.length === 0) {
+                    return api.sendMessage("📜 You have no transaction history.", event.threadID, event.messageID);
+                }
+                const historyMsg = `📜 Your last 5 transaction history items:\n\n${userData.history.slice(0, 5).join("\n\n")}`;
+                return api.sendMessage(historyMsg, event.threadID, event.messageID);
+            case 6: 
+                nextPrompt = "Reset PIN: Please enter your 4-digit new PIN.\n\nExample: <4-digit pin>"; 
+                nextType = 'reset_pin_input'; 
+                break;
+            case 7: 
+                nextPrompt = `🏦 Cash In (Bank to bKash):\nYour current Bank Balance: ${bankUserData.balance.toFixed(2)} BDT\n\nHow much money do you want to Cash In?\n\nExample: <amount>`;
+                nextType = 'cashin_input'; 
+                break;
         }
-        return await message.reply("✅ PIN সফলভাবে সেট করা হয়েছে। মেনু খুলতে ব্যবহার করুন: `.bkash <PIN>`");
-      }
-
-      if(tokens.length<2) return await message.reply("🔐 আপনার ৪-সংখ্যার PIN দিন। উদাহরণ: .bkash 1234");
-
-      const pin = tokens[1];
-      if(!/^\d{4}$/.test(pin)) return await message.reply("❌ PIN অবশ্যই ৪-সংখ্যার হতে হবে।");
-      const okPin = await verifyPIN(uid,pin);
-      if(!okPin) return await message.reply("❌ ভুল PIN দেওয়া হয়েছে।");
-
-      const userObj = db[uid];
-
-      // ---------------- Menu ----------------
-      if(tokens.length===2){
-        const menuLines = [
-          `💸 bKash মেনু — ${userObj.name}`,
-          `💰 ব্যালেন্স: ${fmt(userObj.balance)}`,
-          `🏦 ব্যাংক  : ${fmt(userObj.bank)}`,
-          `1️⃣ টাকা পাঠান   → .bkash ${pin} 1 <UID> <পরিমাণ>`,
-          `2️⃣ ক্যাশ আউট     → .bkash ${pin} 2 <পরিমাণ>`,
-          `3️⃣ মোবাইল রিচার্জ→ .bkash ${pin} 3 <মোবাইল> <পরিমাণ>`,
-          `4️⃣ ব্যালেন্স      → .bkash ${pin} 4`,
-          `5️⃣ ব্যাংকে জমা   → .bkash ${pin} 5 <পরিমাণ>`,
-          `6️⃣ ব্যাংক থেকে তুলুন→ .bkash ${pin} 6 <পরিমাণ>`,
-          `7️⃣ PIN পরিবর্তন   → .bkash ${pin} 7 <নতুন PIN>`,
-          `📜 ইতিহাস      → .bkash ${pin} history`,
-          uid===OWNER_UID ? `👑 এডমিন → .bkash ${pin} admin` : ""
-        ].filter(Boolean).join("\n");
-        return await message.reply(menuLines);
-      }
-
-      // ---------------- Options ----------------
-      const option = tokens[2]?.toLowerCase() || "";
-
-      // --- Send Money (1) ---
-      if(option==="1"||option==="send"){
-        const receiver = tokens[3];
-        const amount = Number(tokens[4]);
-        if(!receiver || !/^\d+$/.test(receiver)) return await message.reply("❌ প্রাপকের UID দিন (শুধুমাত্র সংখ্যা)।");
-        if(!amount||isNaN(amount)||amount<=0) return await message.reply("❌ টাকার পরিমাণ সঠিক নয়।");
-        if(receiver===uid) return await message.reply("❌ নিজের কাছে টাকা পাঠানো যাবে না।");
         
-        const fee = computeFee(amount);
-        const total = amount+fee;
-        if(userObj.balance<total) return await message.reply(`❌ যথেষ্ট ব্যালেন্স নেই (চার্জ সহ): ${fmt(total)}`);
+        api.sendMessage(nextPrompt, event.threadID, (error, info) => {
+            if (error) return console.error(error);
+            global.GoatBot.onReply.set(info.messageID, {
+                commandName: this.config.name,
+                type: nextType,
+                author: event.senderID,
+                bkashPath: Reply.bkashPath,
+                bankPath: Reply.bankPath
+            });
+        }, event.messageID);
+   
+    } else if (Reply.type === 'send_input' || Reply.type === 'cashout_input' || Reply.type === 'recharge_input' || Reply.type === 'reset_pin_input' || Reply.type === 'cashin_input') {
+        const args = event.body.split(/\s+/);
+        let message = "❌ Invalid format. Please try again.";
+        let save = false;
 
-        ensureUser(receiver,`User_${receiver}`);
-        db[uid].balance-=total;
-        db[receiver].balance=(db[receiver].balance||0)+amount;
-        db[OWNER_UID].balance=(db[OWNER_UID].balance||0)+fee; 
-        writeAll(db, true);
+        try {
+            if (Reply.type === 'send_input') {
+                const target = args[0];
+                const amount = parseFloat(args[1]);
+                if (!target || isNaN(amount) || amount <= 0) throw new Error("Format error");
 
-        const txn = makeTxnId();
-        pushHistory(uid,`পাঠানো হয়েছে ${fmt(amount)} UID:${receiver} (চার্জ ${fmt(fee)}) Txn:${txn}`);
-        pushHistory(receiver,`পেয়েছেন ${fmt(amount)} UID:${uid} Txn:${txn}`);
+                const fee = computeFee(amount);
+                const totalCost = amount + fee; 
 
-        const textSend = receiptBox("📱 টাকা পাঠানো সফল ✅",[
-          `💳 প্রেরক   : ${userObj.name} (${uid})`,
-          `👤 প্রাপক   : ${receiver}`,
-          `💰 পরিমাণ  : ${fmt(amount)}`,
-          `💸 চার্জ    : ${fmt(fee)}`,
-          `🆔 ট্রানস্যাকশন আইডি: ${txn}`,
-          `🗓 তারিখ   : ${nowStr()}`,
-          `💳 বর্তমান ব্যালেন্স: ${fmt(db[uid].balance)}`
-        ],pin);
+                if (userData.balance < totalCost) {
+                     message = `❌ Insufficient balance. Required: ${totalCost.toFixed(2)} BDT (including fee of ${fee.toFixed(2)} BDT)`;
+                } else if (target === user) {
+                     message = "❌ Cannot send money to yourself.";
+                } else {
+                    
+                    if (!bkashData[target]) {
+                        const userInfo = (await api.getUserInfo(target))[target];
+                        if (!userInfo || !userInfo.name) throw new Error("Invalid UID");
+                        bkashData[target] = { name: userInfo.name, balance: 0, pin: "1234", history: [] };
+                    }
+                                        
+                    userData.balance -= totalCost; 
+                    bkashData[target].balance += amount; 
+                    bkashData[OWNER_UID].balance += fee; // Owner/Admin collects the fee
+                    
+                    
+                    const txn = "TXN" + Math.floor(1000000 + Math.random() * 9000000);
+                    const time = getTimeNow();
+                    userData.history.unshift(`[${time} | ${txn}] SEND: ${amount.toFixed(2)} BDT`);
 
-        return await message.reply(textSend);
-      }
+                    message = `📱 bKash\n✅ Send Money Successful\n\n🎯 Recipient: ${bkashData[target].name}\n💸 Amount: ${amount.toFixed(2)} BDT\n💰 Fee: ${fee.toFixed(2)} BDT\n\n──────────────────────────────\n🆔 Transaction ID: ${txn}\n💳 Current Balance: ${userData.balance.toFixed(2)} BDT`;
+                    save = true;
+                }
+            } else if (Reply.type === 'cashout_input') {
+                const amount = parseFloat(args[0]);
+                if (isNaN(amount) || amount <= 0) throw new Error("Format error");
 
-      // --- Cash Out (2) ---
-      if(option==="2"||option==="cash"){
-        const amount = Number(tokens[3]);
-        if(!amount||isNaN(amount)||amount<=0) return await message.reply("❌ টাকার পরিমাণ সঠিক নয়।");
-        const fee = computeFee(amount);
-        const total = amount+fee;
-        if(userObj.balance<total) return await message.reply(`❌ যথেষ্ট ব্যালেন্স নেই (চার্জ সহ): ${fmt(total)}`);
+                const fee = computeFee(amount);
+                const totalCost = amount + fee;
+
+                if (userData.balance < totalCost) {
+                    message = `❌ Insufficient balance. Required: ${totalCost.toFixed(2)} BDT (including fee of ${fee.toFixed(2)} BDT)`;
+                } else {
+                 
+                    userData.balance -= totalCost;
+                    bkashData[OWNER_UID].balance += fee; 
+                                     
+                    const txn = "TXN" + Math.floor(1000000 + Math.random() * 9000000);
+                    const time = getTimeNow();
+                    userData.history.unshift(`[${time} | ${txn}] CASHOUT: ${amount.toFixed(2)} BDT`);
+
+                    message = `🏧 bKash\n✅ Cash Out Successful\n\n💵 Amount: ${amount.toFixed(2)} BDT\n💰 Fee: ${fee.toFixed(2)} BDT\n\n──────────────────────────────\n🆔 Transaction ID: ${txn}\n💳 Current Balance: ${userData.balance.toFixed(2)} BDT`;
+                    save = true;
+                }
+            } else if (Reply.type === 'recharge_input') {
+                const mobileNumber = args[0];
+                const amount = parseFloat(args[1]);
+                if (!mobileNumber || !/^\d{11}$/.test(mobileNumber) || isNaN(amount) || amount <= 0) throw new Error("Format error");
+
+                if (userData.balance < amount) {
+                    message = "❌ Insufficient balance.";
+                } else {
+                    
+                    userData.balance -= amount;
+                    
+                    
+                    const txn = "TXN" + Math.floor(1000000 + Math.random() * 9000000);
+                    const time = getTimeNow();
+                    userData.history.unshift(`[${time} | ${txn}] RECHARGE: ${amount.toFixed(2)} BDT`);
+
+                    message = `📶 bKash\n✅ Mobile Recharge Successful\n\n📱 Number: ${mobileNumber}\n💸 Amount: ${amount.toFixed(2)} BDT\n\n──────────────────────────────\n🆔 Transaction ID: ${txn}\n💳 Current Balance: ${userData.balance.toFixed(2)} BDT`;
+                    save = true;
+                }
+            } else if (Reply.type === 'reset_pin_input') {
+                const newPin = args[0]; 
+                if (!newPin || !/^\d{4}$/.test(newPin)) throw new Error("PIN format error");
+
+                userData.pin = newPin;
+                message = `✅ Your PIN has been successfully changed. New PIN: **${newPin}**`;
+                save = true;
+            } else if (Reply.type === 'cashin_input') {
         
-        db[uid].balance-=total;
-        db[OWNER_UID].balance=(db[OWNER_UID].balance||0)+fee; 
-        writeAll(db, true);
+                const amount = parseFloat(args[0]);
+                if (isNaN(amount) || amount <= 0) throw new Error("Format error");
 
-        const txn = makeTxnId();
-        pushHistory(uid,`ক্যাশ আউট ${fmt(amount)} (চার্জ ${fmt(fee)}) Txn:${txn}`);
-        const textCash = receiptBox("💵 ক্যাশ আউট সফল ✅",[
-          `💰 পরিমাণ  : ${fmt(amount)}`,
-          `💸 চার্জ    : ${fmt(fee)}`,
-          `🆔 ট্রানস্যাকশন আইডি: ${txn}`,
-          `🗓 তারিখ   : ${nowStr()}`,
-          `💳 ব্যালেন্স: ${fmt(db[uid].balance)}`
-        ],pin);
-        return await message.reply(textCash);
-      }
+                if (bankUserData.balance < amount) {
+                    message = `❌ Insufficient balance in your bank account. Current Bank Balance: ${bankUserData.balance.toFixed(2)} BDT`;
+                } else {
+                    
+                    bankUserData.balance -= amount; 
+                    userData.balance += amount;    
+                const txn = "TXN" + Math.floor(1000000 + Math.random() * 9000000);
+                    const time = getTimeNow();
+                    userData.history.unshift(`[${time} | ${txn}] CASH IN (Bank): ${amount.toFixed(2)} BDT`);
 
-      // --- Mobile Recharge (3) ---
-      if(option==="3"||option==="recharge"){
-        const mobile = tokens[3];
-        const amount = Number(tokens[4]);
-        if(!mobile || !/^\d{11}$/.test(mobile)) return await message.reply("❌ মোবাইল নম্বর সঠিক নয় (১১-সংখ্যার)।");
-        if(!amount||isNaN(amount)||amount<=0) return await message.reply("❌ টাকার পরিমাণ সঠিক নয়।");
-        const fee = computeFee(amount);
-        const total = amount+fee;
-        if(userObj.balance<total) return await message.reply(`❌ যথেষ্ট ব্যালেন্স নেই (চার্জ সহ): ${fmt(total)}`);
-        
-        db[uid].balance-=total;
-        db[OWNER_UID].balance=(db[OWNER_UID].balance||0)+fee; 
-        writeAll(db, true);
+                    message = `Bank to bKash\n✅ Cash In Successful\n\n💸 Amount: ${amount.toFixed(2)} BDT\n\n──────────────────────────────\n🆔 Transaction ID: ${txn}\n💳 Current bKash Balance: ${userData.balance.toFixed(2)} BDT\n💵 Current Bank Balance: ${bankUserData.balance.toFixed(2)} BDT`;
+                    save = true; 
+                }
+            }
+        } catch(e) {
+            if (e.message === "Invalid UID") {
+                message = "❌ The recipient's UID is incorrect or not found.";
+            } else if (e.message === "PIN format error") {
+                message = "❌ The PIN must be 4 digits.";
+            } else {
+                message = `❌ Invalid input or format. Please try again. (${e.message})`;
+            }
+            save = false; 
+        }
+      
+        if (save) saveAllData();
 
-        const txn = makeTxnId();
-        pushHistory(uid,`মোবাইল রিচার্জ ${mobile} ${fmt(amount)} (চার্জ ${fmt(fee)}) Txn:${txn}`);
-
-        const textRecharge = receiptBox("📱 মোবাইল রিচার্জ সফল ✅",[
-          `📱 মোবাইল : ${mobile}`,
-          `💰 পরিমাণ : ${fmt(amount)}`,
-          `💸 চার্জ   : ${fmt(fee)}`,
-          `🆔 ট্রানস্যাকশন আইডি: ${txn}`,
-          `🗓 তারিখ : ${nowStr()}`,
-          `💳 ব্যালেন্স: ${fmt(db[uid].balance)}`
-        ],pin);
-        return await message.reply(textRecharge);
-      }
-
-      // --- Balance (4) ---
-      if(option==="4"||option==="balance"){
-        const textBalance = receiptBox("💰 আপনার ব্যালেন্স",[
-          `💵 ক্যাশ : ${fmt(db[uid].balance)}`,
-          `🏦 ব্যাংক : ${fmt(db[uid].bank)}`
-        ],pin);
-        return await message.reply(textBalance);
-      }
-
-      // --- Bank Deposit (5) ---
-      if(option==="5"||option==="deposit"){
-        const amount = Number(tokens[3]);
-        if(!amount||isNaN(amount)||amount<=0) return await message.reply("❌ টাকার পরিমাণ সঠিক নয়।");
-        if(userObj.balance<amount) return await message.reply("❌ জমা করার জন্য যথেষ্ট ক্যাশ নেই।");
-        
-        db[uid].balance-=amount;
-        db[uid].bank+=amount;
-        writeAll(db, true);
-        const txn = makeTxnId();
-        pushHistory(uid,`ব্যাংকে জমা ${fmt(amount)} Txn:${txn}`);
-        const textDeposit = receiptBox("🏦 ব্যাংকে জমা সফল ✅",[
-          `💵 পরিমাণ : ${fmt(amount)}`,
-          `💳 ক্যাশ   : ${fmt(db[uid].balance)}`,
-          `🏦 ব্যাংক   : ${fmt(db[uid].bank)}`,
-          `🆔 ট্রানস্যাকশন আইডি: ${txn}`,
-          `🗓 তারিখ   : ${nowStr()}`
-        ],pin);
-        return await message.reply(textDeposit);
-      }
-
-      // --- Bank Withdraw (6) ---
-      if(option==="6"||option==="withdraw"){
-        const amount = Number(tokens[3]);
-        if(!amount||isNaN(amount)||amount<=0) return await message.reply("❌ টাকার পরিমাণ সঠিক নয়।");
-        if(userObj.bank<amount) return await message.reply("❌ ব্যাংক ব্যালেন্স যথেষ্ট নয়।");
-        
-        db[uid].bank-=amount;
-        db[uid].balance+=amount;
-        writeAll(db, true);
-        const txn = makeTxnId();
-        pushHistory(uid,`ব্যাংক থেকে তোলা ${fmt(amount)} Txn:${txn}`);
-        const textWithdraw = receiptBox("🏦 ব্যাংক থেকে তোলা সফল ✅",[
-          `💵 পরিমাণ : ${fmt(amount)}`,
-          `💳 ক্যাশ   : ${fmt(db[uid].balance)}`,
-          `🏦 ব্যাংক   : ${fmt(db[uid].bank)}`,
-          `🆔 ট্রানস্যাকশন আইডি: ${txn}`,
-          `🗓 তারিখ   : ${nowStr()}`
-        ],pin);
-        return await message.reply(textWithdraw);
-      }
-
-      // --- Reset PIN (7) ---
-      if(option==="7"||option==="reset"){
-        const newPin = tokens[3];
-        if(!newPin||!/^\d{4}$/.test(newPin)) return await message.reply("❌ নতুন PIN অবশ্যই ৪-সংখ্যার হতে হবে।");
-        await setPIN(uid,newPin);
-        return await message.reply("✅ PIN সফলভাবে পরিবর্তন হয়েছে। নতুন PIN ব্যবহার করুন।");
-      }
-
-      // --- History ---
-      if(option==="history"){
-        const hist = db[uid]?.history?.slice(0,10).join("\n")||"কোনো হিস্টরি নেই।";
-        const textHist = receiptBox("📜 শেষ লেনদেনসমূহ",[hist],pin);
-        return await message.reply(textHist);
-      }
-
-      // --- Admin / Owner Menu ---
-      if(option==="admin"&&uid===OWNER_UID){
-        const totalUsers = Object.keys(db).length;
-        const totalBalance = Object.values(db).reduce((a,u)=>a+(u.balance||0)+(u.bank||0),0);
-        const textAdmin = receiptBox("👑 এডমিন তথ্য",[
-            `ইউজার সংখ্যা: ${totalUsers}`,
-            `মোট ইউজার ফান্ড: ${fmt(totalBalance)}`,
-            `bKash ফান্ডের ব্যালেন্স: ${fmt(db[OWNER_UID].balance)}`
-        ],pin);
-        return await message.reply(textAdmin);
-      }
-
-      // --- Default ---
-      return await message.reply(receiptBox("❌ অবৈধ অপশন", ["ব্যবহার করুন: 1-send, 2-cash, 3-recharge, 4-balance, 5-deposit, 6-withdraw, 7-reset, বা history"], pin));
-
-    } catch(e){
-      console.error("bkash command error:",e);
-      try{ await message.reply("❌ একটি ত্রুটি হয়েছে। অনুগ্রহ করে পরে আবার চেষ্টা করুন।"); }catch(err){console.error("Fallback message failed:",err);}
+        api.sendMessage(message, event.threadID, event.messageID);
     }
   }
 };
